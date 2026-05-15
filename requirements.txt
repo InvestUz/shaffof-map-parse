@@ -1,0 +1,4 @@
+# scrape_invest.py + scrape_shaffof_map.py
+playwright>=1.40
+pandas>=2.0
+openpyxl>=3.1
