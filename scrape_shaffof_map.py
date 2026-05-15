@@ -73,11 +73,62 @@ class RunDebug:
 
 
 _DBG: RunDebug | None = None
+_LOG_EACH_MAP_CLICK: bool = False
 
 
 def _set_run_debug(d: RunDebug | None) -> None:
     global _DBG
     _DBG = d
+
+
+def _set_log_each_map_click(v: bool) -> None:
+    """When True (or logging level DEBUG), log every viewport/canvas grid click with pixel coords."""
+    global _LOG_EACH_MAP_CLICK
+    _LOG_EACH_MAP_CLICK = bool(v)
+
+
+def _map_click_verbose() -> bool:
+    return _LOG_EACH_MAP_CLICK or logging.getLogger().isEnabledFor(logging.DEBUG)
+
+
+def _log_brute_grid_click(
+    label: str,
+    *,
+    xi: int,
+    yi: int,
+    grid_n: int,
+    cx: float,
+    cy: float,
+    step_index: int,
+    total_steps: int,
+) -> None:
+    """One line per click in verbose mode; otherwise periodic INFO progress."""
+    detail = _map_click_verbose()
+    if detail:
+        logging.info(
+            "%s click cell (xi=%s, yi=%s) on %s×%s grid -> viewport (%.0f, %.0f) [%s/%s]",
+            label,
+            xi,
+            yi,
+            grid_n,
+            grid_n,
+            cx,
+            cy,
+            step_index,
+            total_steps,
+        )
+        return
+    if step_index == 1 or step_index % 35 == 0 or step_index == total_steps:
+        logging.info(
+            "%s progress %s/%s — last viewport (%.0f, %.0f) cell (xi=%s, yi=%s)",
+            label,
+            step_index,
+            total_steps,
+            cx,
+            cy,
+            xi,
+            yi,
+        )
 
 
 async def _action_trace(page: Page, label: str) -> None:
@@ -636,7 +687,9 @@ async def _click_map_area_center(page: Page) -> bool:
             box = await loc.bounding_box()
             if not box or box["width"] < 20 or box["height"] < 20:
                 continue
-            await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+            logging.info("Map container center try %s — click (%.0f, %.0f)", sel, cx, cy)
+            await page.mouse.click(cx, cy)
             return True
         except Error:
             continue
@@ -656,6 +709,35 @@ _IS_CANVAS_ONLY_MAP_JS = """() => {
 }"""
 
 
+_MAP_VIEWPORT_BEST_RECT_JS = """() => {
+  /* Largest on-screen rectangle that looks like the map (Yandex / Leaflet / WebGL canvas). */
+  const MIN_W = 200, MIN_H = 140;
+  const rects = [];
+  function push(el) {
+    if (!el || el.nodeType !== 1) return;
+    const r = el.getBoundingClientRect();
+    if (r.width < MIN_W || r.height < MIN_H) return;
+    rects.push({ left: r.left, top: r.top, width: r.width, height: r.height });
+  }
+  document.querySelectorAll("canvas").forEach(push);
+  document.querySelectorAll(".leaflet-container, .maplibregl-map, .mapboxgl-map").forEach(push);
+  document.querySelectorAll("[class*='ymaps-map'], [class*='ymaps2-map']").forEach(push);
+  document.querySelectorAll("ymaps").forEach((el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width > 320 && r.height > 220) push(el);
+  });
+  if (!rects.length) return null;
+  let best = rects[0];
+  let ba = best.width * best.height;
+  for (let i = 1; i < rects.length; i++) {
+    const r = rects[i];
+    const a = r.width * r.height;
+    if (a > ba) { best = r; ba = a; }
+  }
+  return { x: best.left, y: best.top, w: best.width, h: best.height };
+}"""
+
+
 async def _dismiss_modal_if_open(page: Page) -> None:
     dlg = page.locator('[role="dialog"]').first
     try:
@@ -666,28 +748,46 @@ async def _dismiss_modal_if_open(page: Page) -> None:
         pass
 
 
+_OBJECT_DOC_LABELS = re.compile(r"\bART\b|Kengash|Ekspertiza|Expertiza|QSXN", re.I)
+_OBJECT_CARD_FIELDS = re.compile(r"Loyihachi", re.I)
+_OBJECT_CARD_REGION = re.compile(r"Hududi", re.I)
+
+
 async def _object_ui_opened(page: Page) -> bool:
-    """Modal may use role=dialog or a sheet without that role; object card uses a known image alt."""
+    """
+    True when the object detail sheet is open — not map chrome, not the filter drawer alone.
+
+    Previously any visible h5 longer than 15 chars matched; that false-positive'd on unrelated
+    headings so the scraper stopped on the wrong ymaps node and never saw document buttons.
+    """
     try:
-        if await page.locator('[role="dialog"]').first.is_visible(timeout=120):
+        if await page.locator('img[alt="object image"], img[alt*="object" i]').first.is_visible(timeout=200):
             return True
     except Error:
         pass
     try:
-        if await page.locator('img[alt="object image"], img[alt*="object" i]').first.is_visible(timeout=120):
-            return True
+        dlg = page.locator('[role="dialog"]').first
+        if await dlg.is_visible(timeout=200):
+            try:
+                t = await dlg.inner_text()
+            except Error:
+                t = ""
+            if _OBJECT_DOC_LABELS.search(t) or (
+                _OBJECT_CARD_FIELDS.search(t) and _OBJECT_CARD_REGION.search(t)
+            ):
+                return True
     except Error:
         pass
     try:
         open_sheet = page.locator('[data-state="open"]').filter(has=page.locator("h5"))
-        if await open_sheet.count() and await open_sheet.first.is_visible(timeout=120):
-            return True
-    except Error:
-        pass
-    try:
-        if await page.locator("h5").first.is_visible(timeout=120):
-            t = await page.locator("h5").first.inner_text()
-            if t and len(t.strip()) > 15:
+        if await open_sheet.count() and await open_sheet.first.is_visible(timeout=200):
+            try:
+                t = await open_sheet.first.inner_text()
+            except Error:
+                t = ""
+            if _OBJECT_DOC_LABELS.search(t) or (
+                _OBJECT_CARD_FIELDS.search(t) and _OBJECT_CARD_REGION.search(t)
+            ):
                 return True
     except Error:
         pass
@@ -695,18 +795,60 @@ async def _object_ui_opened(page: Page) -> bool:
 
 
 async def _try_click_ymaps_placemark(page: Page) -> bool:
-    """Yandex Maps JSAPI renders filtered pins as <ymaps class='...-svg-icon' style='position:absolute;…'>."""
-    loc = page.locator("ymaps[class*='-svg-icon'], ymaps[class*='svg-icon']").first
+    """
+    Yandex Maps JSAPI renders pins as <ymaps class='...-svg-icon' …>.
+    There are often many ymaps nodes (controls, clusters); `.first` is frequently not the APZ pin.
+    Try each visible placemark-sized target until the real object sheet opens.
+    """
+    markers = page.locator("ymaps[class*='-svg-icon'], ymaps[class*='svg-icon']")
     try:
-        await loc.wait_for(state="visible", timeout=12_000)
-        await loc.scroll_into_view_if_needed(timeout=5000)
-        await loc.click(timeout=12_000, force=True)
-        await page.wait_for_timeout(500)
-        if await _object_ui_opened(page):
-            logging.info("Opened object UI via Yandex <ymaps> svg-icon placemark click")
-            return True
+        if await markers.count() == 0:
+            logging.debug("ymaps placemark: no matching nodes")
+            return False
+        await markers.first.wait_for(state="visible", timeout=14_000)
     except Error as e:
-        logging.debug("ymaps placemark click: %s", e)
+        logging.debug("ymaps placemark layer: %s", e)
+        return False
+    n = await markers.count()
+    max_try = min(n, 45)
+    for i in range(max_try):
+        loc = markers.nth(i)
+        try:
+            if not await loc.is_visible(timeout=400):
+                continue
+            box = await loc.bounding_box()
+            if not box:
+                continue
+            # Skip nearly invisible hit-slop; allow large cluster icons.
+            if box["width"] < 4 or box["height"] < 4:
+                continue
+            cx = box["x"] + box["width"] / 2
+            cy = box["y"] + box["height"] / 2
+            logging.info(
+                "Yandex placemark try index %s (≈%s svg icons in DOM) — viewport center (%.0f, %.0f), box %.0f×%.0f",
+                i,
+                n,
+                cx,
+                cy,
+                box["width"],
+                box["height"],
+            )
+            await loc.scroll_into_view_if_needed(timeout=5000)
+            await loc.click(timeout=10_000, force=True)
+            await page.wait_for_timeout(550)
+            if await _object_ui_opened(page):
+                logging.info(
+                    "Opened object UI via Yandex placemark index %s (of %s) at (%.0f, %.0f)",
+                    i,
+                    n,
+                    cx,
+                    cy,
+                )
+                return True
+            await _dismiss_modal_if_open(page)
+            await page.wait_for_timeout(200)
+        except Error as e:
+            logging.debug("ymaps placemark click i=%s: %s", i, e)
     return False
 
 
@@ -847,15 +989,99 @@ async def _click_canvas_grid_for_modal(page: Page, *, steps: int = 6, pause_ms: 
     x0, y0, w, h = box["x"], box["y"], box["width"], box["height"]
     mx, my = w * 0.06, h * 0.06
     iw, ih = w - 2 * mx, h - 2 * my
-    n = max(5, min(int(steps), 11))
+    n = max(5, min(int(steps), 24))
+    total = n * n
+    step_i = 0
+    logging.info("Canvas grid: %s×%s on %.0f×%.0f px at origin (%.0f, %.0f)", n, n, w, h, x0, y0)
     for yi in range(n):
         for xi in range(n):
+            step_i += 1
             await _dismiss_modal_if_open(page)
             rel_x = mx + (xi + 0.5) * (iw / n)
             rel_y = my + (yi + 0.5) * (ih / n)
-            await page.mouse.click(x0 + rel_x, y0 + rel_y)
+            cx = x0 + rel_x
+            cy = y0 + rel_y
+            _log_brute_grid_click(
+                "Canvas grid",
+                xi=xi,
+                yi=yi,
+                grid_n=n,
+                cx=cx,
+                cy=cy,
+                step_index=step_i,
+                total_steps=total,
+            )
+            await page.mouse.click(cx, cy)
             await page.wait_for_timeout(pause_ms)
             if await _object_ui_opened(page):
+                logging.info(
+                    "Opened object UI via canvas grid at cell (xi=%s, yi=%s) -> (%.0f, %.0f)",
+                    xi,
+                    yi,
+                    cx,
+                    cy,
+                )
+                return True
+    return False
+
+
+async def _click_map_viewport_grid_for_modal(
+    page: Page,
+    *,
+    steps: int = 12,
+    pause_ms: int = 65,
+    margin_frac: float = 0.03,
+) -> bool:
+    """
+    Brute-force: click a regular grid across the largest visible map viewport. Covers cases
+    where the pin is visible on Yandex/WebGL but DOM placemark clicks do not hit it.
+    """
+    try:
+        rect = await page.evaluate(_MAP_VIEWPORT_BEST_RECT_JS)
+    except Error as e:
+        logging.debug("viewport grid rect: %s", e)
+        return False
+    if not rect or not isinstance(rect, dict):
+        return False
+    try:
+        x0, y0 = float(rect["x"]), float(rect["y"])
+        w, h = float(rect["w"]), float(rect["h"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if w < 80 or h < 80:
+        return False
+    mx, my = w * margin_frac, h * margin_frac
+    iw, ih = w - 2 * mx, h - 2 * my
+    n = max(6, min(int(steps), 26))
+    total = n * n
+    step_i = 0
+    logging.info("Viewport grid: %s×%s clicks on %.0f×%.0f map area", n, n, w, h)
+    for yi in range(n):
+        for xi in range(n):
+            step_i += 1
+            await _dismiss_modal_if_open(page)
+            cx = x0 + mx + (xi + 0.5) * (iw / n)
+            cy = y0 + my + (yi + 0.5) * (ih / n)
+            _log_brute_grid_click(
+                "Viewport grid",
+                xi=xi,
+                yi=yi,
+                grid_n=n,
+                cx=cx,
+                cy=cy,
+                step_index=step_i,
+                total_steps=total,
+            )
+            await page.mouse.click(cx, cy)
+            await page.wait_for_timeout(pause_ms)
+            if await _object_ui_opened(page):
+                logging.info(
+                    "Opened object UI via viewport grid at cell (xi=%s, yi=%s) -> viewport (%.0f, %.0f)",
+                    xi,
+                    yi,
+                    cx,
+                    cy,
+                )
                 return True
     return False
 
@@ -866,12 +1092,18 @@ async def _click_first_marker(page: Page, apz: str) -> None:
     canvas click grid when there is no marker pane.
     """
     await _action_trace(page, "marker_step_start")
+    await page.wait_for_timeout(1200)
+
     if await _try_open_object_via_apz_text(page, apz):
         await _action_trace(page, "marker_opened_via_apz_text_row")
         return
 
     if await _try_click_ymaps_placemark(page):
         await _action_trace(page, "marker_opened_via_ymaps_svg_icon")
+        return
+
+    if await _click_map_viewport_grid_for_modal(page, steps=12, pause_ms=70):
+        await _action_trace(page, "marker_opened_via_viewport_grid_early")
         return
 
     canvas_only = False
@@ -882,11 +1114,11 @@ async def _click_first_marker(page: Page, apz: str) -> None:
 
     if canvas_only:
         logging.info("Canvas/WebGL map (no DOM markers); searching canvas for filtered pin…")
-        if await _click_canvas_grid_for_modal(page):
+        if await _click_canvas_grid_for_modal(page, steps=12):
             return
         logging.info("Zooming in on map and re-trying canvas hit search…")
         await _nudge_zoom_on_canvas(page)
-        if await _click_canvas_grid_for_modal(page):
+        if await _click_canvas_grid_for_modal(page, steps=14):
             return
         if await _try_maplibre_mapbox_programmatic_click(page):
             return
@@ -898,8 +1130,10 @@ async def _click_first_marker(page: Page, apz: str) -> None:
         tag = await page.evaluate(_MARKER_CLICK_JS)
         if tag:
             logging.info("Marker click via evaluate: %s", tag)
-            await page.wait_for_timeout(600)
-            return
+            await page.wait_for_timeout(700)
+            if await _object_ui_opened(page):
+                return
+            logging.debug("Marker evaluate click did not open object sheet; continuing fallbacks")
     except Error as e:
         logging.debug("marker evaluate click: %s", e)
 
@@ -923,27 +1157,41 @@ async def _click_first_marker(page: Page, apz: str) -> None:
         try:
             await loc.wait_for(state="attached", timeout=3500)
             await loc.scroll_into_view_if_needed(timeout=5000)
+            mbox = await loc.bounding_box()
+            if mbox:
+                logging.info(
+                    "Marker try selector %s — viewport click (%.0f, %.0f)",
+                    sel,
+                    mbox["x"] + mbox["width"] / 2,
+                    mbox["y"] + mbox["height"] / 2,
+                )
+            else:
+                logging.info("Marker try selector %s (no bounding box yet)", sel)
             await loc.click(timeout=12_000, force=True)
-            logging.info("Marker click via locator: %s", sel)
-            return
+            await page.wait_for_timeout(550)
+            if await _object_ui_opened(page):
+                return
+            await _dismiss_modal_if_open(page)
+            await page.wait_for_timeout(200)
         except Error as e:
             last_err = e
             continue
 
     if await _click_map_area_center(page):
         logging.info("Marker fallback: clicked map container center")
-        await page.wait_for_timeout(600)
-        try:
-            await page.locator('[role="dialog"]').first.wait_for(state="visible", timeout=4000)
+        await page.wait_for_timeout(700)
+        if await _object_ui_opened(page):
             return
-        except Error:
-            pass
 
-    if await _click_canvas_grid_for_modal(page):
+    if await _click_canvas_grid_for_modal(page, steps=14):
         logging.info("Opened object modal via canvas grid (fallback)")
         return
 
     if await _try_maplibre_mapbox_programmatic_click(page):
+        return
+
+    if await _click_map_viewport_grid_for_modal(page, steps=20, pause_ms=50):
+        await _action_trace(page, "marker_opened_via_viewport_grid_dense")
         return
 
     await _action_trace(page, "marker_all_strategies_failed")
@@ -1051,59 +1299,99 @@ async def _read_modal_kv(modal: Any) -> dict[str, str]:
 
 
 async def _capture_url_from_doc_button(page: Page, button: Any) -> str | None:
-    """Document buttons may open a new tab, navigate the same page, or trigger a download."""
+    """
+    Document buttons may open a new tab, navigate the same page, or trigger a download.
+    Try multiple strategies with longer timeouts to ensure we capture URLs.
+    """
     try:
-        async with page.context.expect_page(timeout=18_000) as pg_info:
-            await button.click(timeout=10_000)
+        await button.scroll_into_view_if_needed(timeout=5000)
+    except Error:
+        pass
+    except Exception:
+        pass
+
+    async def _click_button(force: bool = False) -> None:
+        if force:
+            await button.click(force=True, timeout=12_000)
+            return
+        try:
+            await button.click(timeout=12_000)
+        except Error:
+            await button.click(force=True, timeout=12_000)
+
+    # Strategy 1: Try expect_page first (new tab/window) with generous timeout
+    try:
+        async with page.context.expect_page(timeout=25_000) as pg_info:
+            await _click_button()
         new_page = await pg_info.value
         try:
-            await new_page.wait_for_load_state("domcontentloaded", timeout=25_000)
+            await new_page.wait_for_load_state("domcontentloaded", timeout=30_000)
         except Error:
+            pass
+        except Exception:
             pass
         url = new_page.url
         await new_page.close()
-        if url and url != "about:blank":
+        if url and url not in ("about:blank", ""):
+            logging.debug("Captured URL from new page: %s", url[:100])
             return url
-    except Error:
-        pass
+    except Error as e:
+        logging.debug("expect_page strategy: %s", str(e)[:80])
+    except Exception as e:
+        logging.debug("expect_page exception: %s", str(e)[:80])
 
+    # Strategy 2: Try expect_popup (popup window)
     try:
-        async with page.expect_popup(timeout=18_000) as pop_info:
-            await button.click(timeout=10_000)
+        async with page.expect_popup(timeout=25_000) as pop_info:
+            await _click_button()
         pop = await pop_info.value
         try:
-            await pop.wait_for_load_state("domcontentloaded", timeout=25_000)
+            await pop.wait_for_load_state("domcontentloaded", timeout=30_000)
         except Error:
+            pass
+        except Exception:
             pass
         url = pop.url
         await pop.close()
-        if url and url != "about:blank":
+        if url and url not in ("about:blank", ""):
+            logging.debug("Captured URL from popup: %s", url[:100])
             return url
-    except Error:
-        pass
+    except Error as e:
+        logging.debug("expect_popup strategy: %s", str(e)[:80])
+    except Exception as e:
+        logging.debug("expect_popup exception: %s", str(e)[:80])
 
+    # Strategy 3: Try expect_download (direct file download)
+    try:
+        async with page.expect_download(timeout=25_000) as dl_info:
+            await button.click(timeout=12_000)
+        dl = await dl_info.value
+        u = dl.url
+        if u and u not in ("about:blank", ""):
+            logging.debug("Captured URL from download: %s", u[:100])
+            return u
+    except Error as e:
+        logging.debug("expect_download strategy: %s", str(e)[:80])
+    except Exception as e:
+        logging.debug("expect_download exception: %s", str(e)[:80])
+
+    # Strategy 4: Try navigation (same page navigation)
     prev = page.url
     try:
-        async with page.expect_navigation(timeout=18_000, wait_until="domcontentloaded"):
-            await button.click(timeout=10_000)
+        async with page.expect_navigation(timeout=20_000, wait_until="domcontentloaded"):
+            await button.click(timeout=12_000)
         if page.url != prev and "open-data.mc.uz/map" not in page.url:
             u = page.url
+            logging.debug("Captured URL from navigation: %s", u[:100])
             await page.go_back(wait_until="domcontentloaded", timeout=30_000)
             await _wait_object_modal(page)
             return u
-    except Error:
-        pass
+    except Error as e:
+        logging.debug("expect_navigation strategy: %s", str(e)[:80])
+    except Exception as e:
+        logging.debug("expect_navigation exception: %s", str(e)[:80])
 
-    try:
-        async with page.expect_download(timeout=18_000) as dl_info:
-            await button.click(timeout=10_000)
-        dl = await dl_info.value
-        u = dl.url
-        if u:
-            return u
-    except Error:
-        pass
-
+    logging.debug("All strategies failed to capture URL from button click")
     return None
 
 
@@ -1115,10 +1403,21 @@ def _ekspertiza_pdf_response_handler(sink: list[str]):
             if response.status != 200:
                 return
             u = response.url
-            if "api-ekspertiza.mc.uz" not in u.lower():
+            low_u = u.lower()
+            if "api-ekspertiza.mc.uz" not in low_u:
                 return
             ct = (response.headers.get("content-type") or "").lower()
-            if "pdf" not in ct and "octet-stream" not in ct:
+            # open-data details JSON often has no ekspertiza URL; the modal fetches this on click.
+            # Some deployments omit or vary Content-Type — still record known conclusion PDF paths.
+            path_like_conclusion_pdf = any(
+                p in low_u
+                for p in (
+                    "appeal-final-conclusion-pdf",
+                    "final-conclusion-pdf",
+                    "conclusion-pdf",
+                )
+            )
+            if not path_like_conclusion_pdf and "pdf" not in ct and "octet-stream" not in ct:
                 return
             if u not in sink:
                 sink.append(u)
@@ -1133,6 +1432,7 @@ async def _extract_doc_urls(page: Page, modal: Any) -> dict[str, str | None]:
     Map document line labels to URL columns.
     Order follows typical modal listing: ART, Kengash, Ekspertiza, QSXN.
     Uses the same sheet root as _read_modal_kv (dialog or data-state=open), not only role=dialog.
+    Aggressively tries multiple selector strategies for each document type.
     """
     patterns: list[tuple[str, re.Pattern[str]]] = [
         ("url_art", re.compile(r"\bART\b", re.I)),
@@ -1150,65 +1450,205 @@ async def _extract_doc_urls(page: Page, modal: Any) -> dict[str, str | None]:
             await modal.wait_for(state="visible", timeout=8000)
         except Error:
             break
-        label_cell = modal.locator("p, span, div").filter(has_text=pat)
+        
+        logging.debug("Searching for %s with pattern: %s", key, pat.pattern)
+        
+        # Try to find direct link first
+        try:
+            link = modal.locator(f'a[href^="http"], a[href*="api.dx"], a[href*="ekspertiza"]').filter(
+                has_text=pat
+            ).first
+            if await link.count():
+                href = (await link.get_attribute("href") or "").strip()
+                if href.startswith("http"):
+                    logging.info("Found %s via direct link: %s", key, href[:80])
+                    out[key] = href
+                    continue
+        except Error:
+            pass
+
+        # Try to find label and then associated button/link
+        label_cell = modal.locator("p, span, div, label").filter(has_text=pat)
+        if await label_cell.count() == 0:
+            logging.debug("%s label not found, trying to find button by pattern", key)
+            # Try to find button by text pattern directly
+            try:
+                btn = modal.locator("button").filter(has_text=pat).first
+                if await btn.count():
+                    logging.debug("Found button for %s by text filter", key)
+                    url = await _capture_url_from_doc_button(page, btn)
+                    if url:
+                        logging.info("Found %s via button text filter: %s", key, url[:80])
+                        out[key] = url
+                        continue
+            except Error:
+                pass
+            continue
+            
         row = modal.locator("div.flex.justify-between").filter(has=label_cell)
         if await row.count() == 0:
             row = modal.locator("div.flex").filter(has=label_cell)
+        if await row.count() == 0:
+            row = label_cell.first.locator("xpath=ancestor::*[contains(@class,'flex')][1]")
+        
         r0 = row.first
         try:
+            # Try link first
             link = r0.locator("a[href^='http']").first
             if await link.count():
                 href = (await link.get_attribute("href") or "").strip()
                 if href.startswith("http"):
+                    logging.info("Found %s via row link: %s", key, href[:80])
                     out[key] = href
                     continue
+            
+            # Try button click to open URL
             btn = r0.locator("button").first
             if await btn.count() == 0:
+                logging.debug("%s has no button in row, trying parent search", key)
+                # Try to find in parent or sibling
+                parent = r0.locator("xpath=..")
+                btn = parent.locator("button").first
+                if await btn.count() == 0:
+                    logging.debug("%s button not found in row or parent", key)
+            else:
+                logging.debug("Attempting to click button for %s", key)
+            
+            if await btn.count():
+                url = await _capture_url_from_doc_button(page, btn)
+                if url:
+                    logging.info("Found %s via button click: %s", key, url[:80])
+                    out[key] = url
+                    continue
+
+            # Fallback: try any matching clickable element in the modal if row search fails
+            candidates = modal.locator("a, button, span, div, [role=button]").filter(has_text=pat)
+            cand_count = min(await candidates.count(), 20)
+            for idx in range(cand_count):
+                candidate = candidates.nth(idx)
+                href = (await candidate.get_attribute("href") or "").strip()
+                if href.startswith("http"):
+                    logging.info("Found %s via modal fallback link: %s", key, href[:80])
+                    out[key] = href
+                    break
+                url = await _capture_url_from_doc_button(page, candidate)
+                if url:
+                    logging.info("Found %s via modal fallback click: %s", key, url[:80])
+                    out[key] = url
+                    break
+            if out[key]:
                 continue
-            url = await _capture_url_from_doc_button(page, btn)
-            out[key] = url
         except Error as e:
-            logging.debug("doc row %s: %s", key, e)
+            logging.debug("Error processing %s row: %s", key, e)
             out[key] = None
 
-    await _fill_doc_urls_from_modal_link_scan(modal, out)
+    # Final scan for any missed links
+    await _fill_doc_urls_from_modal_link_scan(page, modal, out)
     return out
 
 
-async def _fill_doc_urls_from_modal_link_scan(modal: Any, out: dict[str, str | None]) -> None:
-    """Row-based matching often misses Ekspertiza/QSXN; scan the sheet for known hosts."""
+async def _fill_doc_urls_from_modal_link_scan(page: Page, modal: Any, out: dict[str, str | None]) -> None:
+    """
+    Row-based matching often misses Ekspertiza/QSXN; scan the sheet comprehensively for known URL patterns.
+    Try to click buttons that might open ekspertiza or QSXN documents.
+    """
+    async def _scan_modal_html_for_urls(pattern: re.Pattern[str]) -> list[str]:
+        try:
+            html = await modal.inner_html()
+        except Error:
+            return []
+        return pattern.findall(html)
+
     try:
+        # Comprehensive link scan for ekspertiza
         if not out.get("url_ekspertiza"):
+            # First try direct link attributes
             loc = modal.locator(
-                'a[href*="api-ekspertiza.mc.uz"], a[href*="ekspertiza.mc.uz"], a[href*="new-ekspertiza"]'
+                'a[href*="api-ekspertiza.mc.uz"], a[href*="ekspertiza.mc.uz"], a[href*="new-ekspertiza"], '
+                'a[href*="appeal-final"], a[href*="conclusion-pdf"], a[href*="/pdf/"]'
             )
             n = await loc.count()
-            for i in range(min(n, 12)):
+            logging.debug("Found %d potential ekspertiza links", n)
+            for i in range(min(n, 15)):
                 href = (await loc.nth(i).get_attribute("href") or "").strip()
                 if not href.startswith("http"):
                     continue
                 low = href.lower()
+                # Prefer links that look like final conclusions or PDFs
                 if any(
                     x in low
                     for x in ("appeal-final-conclusion", "final-conclusion-pdf", "conclusion-pdf", "/pdf/")
                 ):
                     out["url_ekspertiza"] = href
+                    logging.info("Found ekspertiza URL via pattern match: %s", href[:100])
                     break
+            # If still not found, take the first one
             if not out.get("url_ekspertiza") and n:
                 href = (await loc.first.get_attribute("href") or "").strip()
                 if href.startswith("http"):
                     out["url_ekspertiza"] = href
+                    logging.info("Found ekspertiza URL via first link: %s", href[:100])
+
+        if not out.get("url_ekspertiza"):
+            candidates = modal.locator("a, button, span, div, [role=button]").filter(has_text=re.compile(r"ekspertiza|expertiza|yig'ma ekspertiza", re.I))
+            count = min(await candidates.count(), 20)
+            for i in range(count):
+                candidate = candidates.nth(i)
+                href = (await candidate.get_attribute("href") or "").strip()
+                if href.startswith("http"):
+                    out["url_ekspertiza"] = href
+                    logging.info("Found ekspertiza URL via modal candidate link: %s", href[:100])
+                    break
+                url = await _capture_url_from_doc_button(page, candidate)
+                if url:
+                    out["url_ekspertiza"] = url
+                    logging.info("Found ekspertiza URL via modal candidate click: %s", url[:100])
+                    break
+
+        if not out.get("url_ekspertiza"):
+            html_urls = await _scan_modal_html_for_urls(re.compile(r"https?://api-ekspertiza\.mc\.uz/[^\s\"'<>]+", re.I))
+            if html_urls:
+                out["url_ekspertiza"] = html_urls[0]
+                logging.info("Found ekspertiza URL via modal HTML scan: %s", out["url_ekspertiza"][:100])
+
+        if not out.get("url_ekspertiza"):
+            html_urls = await _scan_modal_html_for_urls(re.compile(r"https?://[^\s\"'<>]+appeal-final-conclusion-pdf[^\s\"'<>]+", re.I))
+            if html_urls:
+                out["url_ekspertiza"] = html_urls[0]
+                logging.info("Found ekspertiza URL via generic PDF URL scan: %s", out["url_ekspertiza"][:100])
+
+        # Comprehensive link scan for QSXN
+        if not out.get("url_qsxn"):
+            locq = modal.locator(
+                'a[href*="qsxn"], a[href*="xabarnoma"], a[href*="dx.mc.uz"][href*="module1"], '
+                'a[href*="module1"], button:has-text("QSXN")'
+            )
+            nq = await locq.count()
+            logging.debug("Found %d potential QSXN links", nq)
+            for i in range(min(nq, 15)):
+                href = (await locq.nth(i).get_attribute("href") or "").strip()
+                if href and href.startswith("http"):
+                    out["url_qsxn"] = href
+                    logging.info("Found QSXN URL via link: %s", href[:100])
+                    break
 
         if not out.get("url_qsxn"):
-            locq = modal.locator('a[href*="qsxn"], a[href*="xabarnoma"], a[href*="dx.mc.uz"][href*="module1"]')
-            nq = await locq.count()
-            for i in range(min(nq, 8)):
-                href = (await locq.nth(i).get_attribute("href") or "").strip()
+            candidates = modal.locator("a, button, span, div, [role=button]").filter(has_text=re.compile(r"qsxn|xabarnoma", re.I))
+            count = min(await candidates.count(), 20)
+            for i in range(count):
+                candidate = candidates.nth(i)
+                href = (await candidate.get_attribute("href") or "").strip()
                 if href.startswith("http"):
                     out["url_qsxn"] = href
+                    logging.info("Found QSXN URL via modal candidate link: %s", href[:100])
+                    break
+                url = await _capture_url_from_doc_button(page, candidate)
+                if url:
+                    out["url_qsxn"] = url
+                    logging.info("Found QSXN URL via modal candidate click: %s", url[:100])
                     break
     except Error as e:
-        logging.debug("modal link scan: %s", e)
+        logging.debug("modal comprehensive link scan: %s", e)
 
 
 def _empty_scrape_result(message: str) -> dict[str, Any]:
@@ -1413,6 +1853,7 @@ def write_shaffof_xlsx(df: pd.DataFrame, out_path: Path) -> Path:
 
 async def run(args: argparse.Namespace) -> int:
     setup_logging(args.verbose)
+    _set_log_each_map_click(bool(args.log_map_clicks))
     inp = Path(args.input).expanduser().resolve()
     if not inp.exists():
         logging.error("Input not found: %s", inp)
@@ -1560,6 +2001,7 @@ async def run(args: argparse.Namespace) -> int:
 
     finally:
         _set_run_debug(None)
+        _set_log_each_map_click(False)
 
     logging.info("Done. Wrote %s", last_written or Path(args.output).expanduser().resolve())
     return 0
@@ -1617,6 +2059,11 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="Process at most N APZ rows (0 = all)")
     ap.add_argument("--warmup-seconds", type=int, default=0)
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument(
+        "--log-map-clicks",
+        action="store_true",
+        help="Log every viewport/canvas grid click at INFO (cell xi,yi and viewport x,y). Same behavior when -v/--verbose is set (DEBUG enables detailed grid lines).",
+    )
     args = ap.parse_args()
     if args.retry_errors and not args.resume:
         ap.error("--retry-errors requires --resume")
